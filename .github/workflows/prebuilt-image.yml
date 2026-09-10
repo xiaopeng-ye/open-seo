@@ -7,9 +7,8 @@ name: Publish prebuilt image
 # a GitHub-hosted runner, and publishes the result so the container only serves.
 # See docker/Dockerfile.prebuilt.
 #
-# The weekly run first fast-forwards the fork from upstream (we only add files,
-# so this stays a clean merge) and then rebuilds, which keeps our image tracking
-# upstream releases without any manual step.
+# The weekly run first syncs this private fork from the public upstream, then
+# rebuilds, so the image tracks upstream releases without a manual step.
 
 on:
   push:
@@ -21,23 +20,46 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # merge-upstream on the scheduled run
+  contents: write # push the upstream merge back to main
   packages: write # push to GHCR
+
+env:
+  UPSTREAM_REPO: https://github.com/every-app/open-seo.git
+  UPSTREAM_BRANCH: main
 
 jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward fork from upstream
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
-            -f branch=main \
-            || echo "Nothing to merge (upstream already applied)."
-
       - uses: actions/checkout@v4
+        with:
+          # The upstream sync below merges, which needs real history. The default
+          # single-commit clone cannot merge.
+          fetch-depth: 0
+
+      - name: Sync from upstream
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+
+          # Deliberately plain git rather than the merge-upstream API: that
+          # endpoint returns an unexplained 422 once this fork is private, and a
+          # silently dead sync is worse than no sync. The public upstream is
+          # fetchable without credentials, and any failure here fails the build.
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "Already up to date with upstream ($(git rev-parse --short "upstream/$UPSTREAM_BRANCH"))."
+            exit 0
+          fi
+
+          echo "Upstream has moved: merging $(git rev-parse --short "upstream/$UPSTREAM_BRANCH") into main."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Resolve version from package.json
         id: ver
