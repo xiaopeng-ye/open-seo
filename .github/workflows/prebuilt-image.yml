@@ -2,49 +2,40 @@ name: Publish prebuilt image
 
 # Builds the NexoFlux prebuilt OpenSEO image and pushes it to GHCR.
 #
-# Upstream's published image compiles the app at *container start*, which needs a
-# multi-GB Node heap on the Docker host. This workflow does that compile once, on
-# a GitHub-hosted runner, and publishes the result so the container only serves.
-# See docker/Dockerfile.prebuilt.
+# One image per official upstream release: the tag is the version in
+# package.json, and the build is SKIPPED when that tag is already in the
+# registry. Upstream pushes commits far more often than it cuts a release
+# (78 commits in 30 days, one release), so without that check every sync would
+# rebuild the same tag with different bytes and drift the digest out from under
+# whatever is deployed.
 #
-# The weekly run first fast-forwards this fork from the public upstream via the
-# fork-sync API, then rebuilds, so the image tracks upstream releases with no
-# manual step.
+# Upstream's own image compiles the app at *container start*, which needs a
+# multi-GB Node heap on the Docker host; this workflow does that compile once on
+# a runner instead. See docker/Dockerfile.prebuilt.
+#
+# Off this repo: a daily Hermes cron rebases this fork onto upstream and pushes
+# to main, and that push is what runs this workflow. Deployment is the usual
+# Renovate PR bumping the image tag in docker/open-seo/compose.yaml.
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
-  schedule:
-    # Mondays 04:00 UTC: pull upstream changes in, then rebuild.
-    - cron: "0 4 * * 1"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this version's tag already exists (use after changing Dockerfile.prebuilt)"
+        type: boolean
+        default: false
 
 permissions:
-  contents: write # merge-upstream writes to this fork's main
+  contents: read
   packages: write # push to GHCR
 
 jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      # Deliberately before checkout, and deliberately without any `|| echo`:
-      # an earlier revision of this workflow hid a failure behind a fallback, so
-      # every run reported success while the weekly upstream sync was dead. If
-      # this step cannot reach upstream, the build must go red.
-      #
-      # merge-upstream only works while this repository is a real fork of
-      # every-app/open-seo. If the fork link is ever lost (a public → private →
-      # public visibility round trip severs it), it returns 422 and this fails
-      # loudly rather than shipping a stale image forever.
-      - name: Sync fork from upstream
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
-
       - uses: actions/checkout@v4
 
       - name: Resolve version from package.json
@@ -61,7 +52,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}"
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "exists=true" >>"$GITHUB_OUTPUT"
+            echo "$IMAGE already published — nothing to do."
+          else
+            echo "exists=false" >>"$GITHUB_OUTPUT"
+            echo "$IMAGE not published yet — building."
+          fi
+
       - name: Build and push
+        if: steps.check.outputs.exists != 'true' || inputs.force
         uses: docker/build-push-action@v6
         with:
           context: .
