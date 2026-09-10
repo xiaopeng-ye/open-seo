@@ -18,9 +18,11 @@ name: Publish prebuilt image
 # Renovate PR bumping the image tag in docker/open-seo/compose.yaml.
 
 on:
+  # No tag trigger on purpose: this fork's tags are only ever upstream's, and a tag
+  # appearing in a fork does not fire a push event. The version that gets built comes
+  # from package.json, not from a git tag, so the push below is the only real trigger.
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       force:
