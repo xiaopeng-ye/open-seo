@@ -1,0 +1,51 @@
+# NexoFlux prebuilt OpenSEO image
+#
+# Why this exists
+# ---------------
+# Upstream's `Dockerfile.selfhost` deliberately ships NO build output: the image
+# carries the source + node_modules, and `docker-entrypoint.sh` runs a full
+# `pnpm run build` (TanStack SSR, ~7400 modules) every time a container starts
+# with a stale/missing build fingerprint. Upstream's own `.npmrc` pins
+# `node-options=--max-old-space-size=4096` because the default ~2 GiB heap is not
+# enough. That is fine on a laptop; it is not fine on a small Docker host, where
+# it costs a multi-GB heap spike and minutes of CPU on every image update.
+#
+# This image derives from the official one and bakes that build at *image build*
+# time (GitHub-hosted runner), so the container only has to serve. Nothing here
+# modifies upstream files: the entrypoint is patched at build time by
+# `patch-entrypoint.js`, which fails the build loudly if upstream changes shape.
+#
+# Base image is the official published image on purpose, so the compiled output
+# always matches the source it was compiled from.
+
+FROM ghcr.io/every-app/open-seo:latest
+
+# The client bundle inlines these at build time (see vite.config.ts `envPrefix`
+# and src/lib/auth-mode.ts). They MUST match the runtime environment, or the
+# browser bundle and the server disagree about the auth mode.
+ARG AUTH_MODE=cloudflare_access
+ARG VITE_SHOW_DEVTOOLS=false
+
+COPY docker/patch-entrypoint.js /tmp/patch-entrypoint.js
+
+# Build the client + server once, here, with the same env the runtime will use.
+RUN AUTH_MODE="${AUTH_MODE}" \
+    VITE_SHOW_DEVTOOLS="${VITE_SHOW_DEVTOOLS}" \
+    pnpm run build
+
+# The `.openseo-prebuilt` marker on its own is NOT enough: upstream's
+# fingerprint comparison would still rebuild whenever the runtime env differs
+# from the build env. Hence the entrypoint patch as well.
+RUN node /tmp/patch-entrypoint.js \
+ && printf '%s' "${AUTH_MODE}" > dist/.openseo-prebuilt \
+ && rm -f /tmp/patch-entrypoint.js
+
+EXPOSE 3001
+
+# Without the in-container build the start-up penalty is gone, so the upstream
+# 300s start period (sized for "migrations + multi-minute vite build") is far
+# more than we need.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/api/health').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"
+
+CMD ["sh", "docker-entrypoint.sh"]
