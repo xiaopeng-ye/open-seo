@@ -1,0 +1,71 @@
+name: Publish prebuilt image
+
+# Builds the NexoFlux prebuilt OpenSEO image and pushes it to GHCR.
+#
+# Upstream's published image compiles the app at *container start*, which needs a
+# multi-GB Node heap on the Docker host. This workflow does that compile once, on
+# a GitHub-hosted runner, and publishes the result so the container only serves.
+# See docker/Dockerfile.prebuilt.
+#
+# The weekly run first fast-forwards the fork from upstream (we only add files,
+# so this stays a clean merge) and then rebuilds, which keeps our image tracking
+# upstream releases without any manual step.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    # Mondays 04:00 UTC: pull upstream changes in, then rebuild.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write # merge-upstream on the scheduled run
+  packages: write # push to GHCR
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward fork from upstream
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=main \
+            || echo "Nothing to merge (upstream already applied)."
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from package.json
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.prebuilt
+          # The Docker host is amd64 only; skip the arm64 leg.
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.title=OpenSEO (NexoFlux prebuilt)
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Prebuilt OpenSEO self-host image: app compiled at image build time instead of container start.
